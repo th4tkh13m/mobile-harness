@@ -120,12 +120,14 @@ class CuratedMemoryStore:
         if not clean:
             raise ValueError("memory candidate is empty or unsafe")
         resolved = kind if kind in {"success", "failure_avoidance", "preference"} else "success"
-        self._append(self.staged, CuratedMemory(clean, resolved, "", session_id, datetime.now(timezone.utc).isoformat(), "model_candidate"))
+        with self._promotion_lock():
+            self._append(self.staged, CuratedMemory(clean, resolved, "", session_id, datetime.now(timezone.utc).isoformat(), "model_candidate"))
 
     def promote(self, memory: CuratedMemory, *, verified: bool, reviewed: bool) -> None:
         if memory.kind == "success" and not verified: raise PermissionError("success memory requires verifier evidence")
         if memory.kind == "failure_avoidance" and not reviewed: raise PermissionError("failure avoidance requires curator review")
-        self._append(self.promoted, memory)
+        with self._promotion_lock():
+            self._append(self.promoted, memory)
 
     def recall(self, query: str, limit: int = 5) -> tuple[CuratedMemory, ...]:
         scored = []
@@ -137,6 +139,16 @@ class CuratedMemoryStore:
                 quality = 2 if item.kind == "success" and item.provenance == "verified_curator" else 1 if item.kind == "preference" else 0
                 scored.append((score, quality, item.created_at, item))
         return tuple(item for _, _, _, item in sorted(scored, reverse=True, key=lambda pair: pair[:3])[:limit])
+
+    def snapshot(self, limit: int = 12, char_limit: int = 4_000) -> tuple[CuratedMemory, ...]:
+        """Bounded prompt-safe memory injection, newest entries first."""
+        used, selected = 0, []
+        for item in reversed(self._read(self.promoted)):
+            size = len(item.summary) + len(item.evidence)
+            if selected and (len(selected) >= limit or used + size > char_limit):
+                continue
+            selected.append(item); used += size
+        return tuple(reversed(selected))
 
     def _append(self, path: Path, item: CuratedMemory) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +174,11 @@ class CuratedMemoryStore:
                 verified = candidate.kind != "success" or bool(verifier_evidence)
                 if (candidate.kind == "success" and verified) or (candidate.kind == "failure_avoidance" and reviewed):
                     item = CuratedMemory(candidate.summary, candidate.kind, verifier_evidence or "curator-reviewed", session_id, datetime.now(timezone.utc).isoformat(), "verified_curator" if verifier_evidence else "reviewed_curator")
-                    self.promote(item, verified=verified, reviewed=reviewed)
+                    # We already hold the cross-process promotion transaction
+                    # lock. Calling the public promote() would re-open and lock
+                    # the same file descriptor path, which can deadlock on
+                    # POSIX advisory locks.
+                    self._append(self.promoted, item)
                     self._append_ledger(candidate_id)
                     promoted.append(item)
             return tuple(promoted)
@@ -196,16 +212,17 @@ class CuratedMemoryStore:
 
     def prune(self, retention_days: int = 90, keep: int = 500) -> int:
         """Bound durable recall while retaining newest evidence-backed memories."""
-        now = datetime.now(timezone.utc); retained = []
-        for item in self._read(self.promoted):
-            try: age = now - datetime.fromisoformat(item.created_at)
-            except ValueError: age = timedelta(0)
-            if age.days <= retention_days: retained.append(item)
-        retained = retained[-keep:]; self.promoted.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.promoted.with_suffix(".tmp")
-        temporary.write_text("".join(json.dumps(asdict(item), ensure_ascii=False) + "\n" for item in retained), encoding="utf-8")
-        temporary.replace(self.promoted)
-        return len(retained)
+        with self._promotion_lock():
+            now = datetime.now(timezone.utc); retained = []
+            for item in self._read(self.promoted):
+                try: age = now - datetime.fromisoformat(item.created_at)
+                except ValueError: age = timedelta(0)
+                if age.days <= retention_days: retained.append(item)
+            retained = retained[-keep:]; self.promoted.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.promoted.with_suffix(".tmp")
+            temporary.write_text("".join(json.dumps(asdict(item), ensure_ascii=False) + "\n" for item in retained), encoding="utf-8")
+            temporary.replace(self.promoted)
+            return len(retained)
 
     @staticmethod
     def _candidate_id(candidate: CuratedMemory) -> str:

@@ -79,9 +79,9 @@ def androidworld_action_factory(action: Action, width: int, height: int) -> Any:
         return JSONAction(action_type="click", x=pixel(action.x, width), y=pixel(action.y, height))
     if action.kind is ActionKind.TYPE_TEXT:
         return JSONAction(action_type="input_text", text=action.text)
-    if action.kind is ActionKind.BACK:
+    if action.kind is ActionKind.KEY and action.key in {"BACK", "KEYCODE_BACK"}:
         return JSONAction(action_type="navigate_back")
-    if action.kind is ActionKind.HOME:
+    if action.kind is ActionKind.KEY and action.key in {"HOME", "KEYCODE_HOME"}:
         return JSONAction(action_type="navigate_home")
     if action.kind is ActionKind.LAUNCH_APP:
         return JSONAction(action_type="open_app", app_name=action.package)
@@ -193,13 +193,13 @@ def _mobileworld_action(action: Action, width: int, height: int) -> Any:
     if action.kind is ActionKind.TYPE_TEXT:
         return JSONAction(action_type="input_text", text=action.text)
     if action.kind is ActionKind.KEY:
+        if action.key in {"BACK", "KEYCODE_BACK"}:
+            return JSONAction(action_type="navigate_back")
+        if action.key in {"HOME", "KEYCODE_HOME"}:
+            return JSONAction(action_type="navigate_home")
         if action.key != "ENTER":
-            raise ValueError("MobileWorld adapter currently supports only KEY ENTER")
+            raise ValueError("MobileWorld adapter currently supports only KEY ENTER, BACK, or HOME")
         return JSONAction(action_type="keyboard_enter")
-    if action.kind is ActionKind.BACK:
-        return JSONAction(action_type="navigate_back")
-    if action.kind is ActionKind.HOME:
-        return JSONAction(action_type="navigate_home")
     if action.kind is ActionKind.LAUNCH_APP:
         return JSONAction(action_type="open_app", app_name=action.package)
     if action.kind is ActionKind.WAIT:

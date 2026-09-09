@@ -16,7 +16,7 @@ from mobile_harness.model import Action, ActionKind, Decision
 class _HomeThenDone:
     def decide(self, task, observation, history):
         if not history:
-            return Decision(action=Action(ActionKind.HOME))
+            return Decision(action=Action(ActionKind.KEY, key="HOME"))
         return Decision(done=True)
 
 

@@ -7,10 +7,10 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Protocol
 
-from .model import Action, ActionKind, ActionResult, Observation, Rect, UIElement
+from .model import Action, ActionKind, ActionResult, Observation, Rect, UIElement, validate_key_name
 
 
 class DevicePort(Protocol):
@@ -93,11 +93,14 @@ class AdbDevice(DevicePort):
             return None
         if action.kind is ActionKind.TAP:
             x, y = resolve_tap(action, observation)
+            x, y = observation.to_physical_point(x, y)
             return ("shell", "input", "tap", str(x), str(y))
         if action.kind is ActionKind.SWIPE:
             if None in (action.x, action.y, action.x2, action.y2):
                 raise ValueError("swipe requires four normalized coordinates")
-            return ("shell", "input", "swipe", str(pixel(action.x, observation.width)), str(pixel(action.y, observation.height)), str(pixel(action.x2, observation.width)), str(pixel(action.y2, observation.height)), str(action.duration_ms))
+            x, y = observation.to_physical_point(pixel(action.x, observation.width), pixel(action.y, observation.height))
+            x2, y2 = observation.to_physical_point(pixel(action.x2, observation.width), pixel(action.y2, observation.height))
+            return ("shell", "input", "swipe", str(x), str(y), str(x2), str(y2), str(action.duration_ms))
         if action.kind is ActionKind.TYPE_TEXT:
             if not action.text:
                 raise ValueError("type_text requires text")
@@ -105,13 +108,7 @@ class AdbDevice(DevicePort):
                 raise ValueError("ADB input text only supports ASCII; configure an IME adapter for Unicode")
             return ("shell", "input", "text", action.text.replace(" ", "%s"))
         if action.kind is ActionKind.KEY:
-            if not action.key:
-                raise ValueError("key requires a keycode/name")
-            return ("shell", "input", "keyevent", action.key)
-        if action.kind is ActionKind.BACK:
-            return ("shell", "input", "keyevent", "BACK")
-        if action.kind is ActionKind.HOME:
-            return ("shell", "input", "keyevent", "HOME")
+            return ("shell", "input", "keyevent", validate_key_name(action.key))
         if action.kind is ActionKind.LAUNCH_APP and action.package:
             return ("shell", "monkey", "-p", action.package, "1")
         raise ValueError(f"unsupported or incomplete action: {action}")
@@ -140,8 +137,10 @@ def resolve_adb_path() -> str:
     if os.environ.get("LOCALAPPDATA"):
         roots.append(str(Path(os.environ["LOCALAPPDATA"]) / "Android" / "Sdk"))
     for root in filter(None, roots):
-        candidate = Path(root) / "platform-tools" / executable
-        if candidate.is_file():
+        # Permit a Windows SDK path during cross-platform orchestration/tests;
+        # host OS is not the authority for the target SDK path format.
+        candidate = (PureWindowsPath(root) / "platform-tools" / "adb.exe") if re.match(r"^[A-Za-z]:[\\/]", root) else (Path(root) / "platform-tools" / executable)
+        if Path(str(candidate)).is_file():
             return str(candidate)
     raise FileNotFoundError("ADB was not found; set ANDROID_HOME/ANDROID_SDK_ROOT or add platform-tools to PATH")
 

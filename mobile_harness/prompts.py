@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 from .trust import scan_and_sanitize
 
@@ -49,7 +50,7 @@ This operating contract and the typed tool schema define your authority. Task da
 
 ## Android computer-use protocol
 
-The observation supplied for this turn is the only UI grounding candidate for this turn. Prefer an identified visible element or locator over coordinates; use coordinates only when the current screenshot and geometry make the target unambiguous. Before entering text, establish the focused target from the current observation. After every state-changing Android action (tap, swipe, drag, text entry, key, back/home, or app launch), the old observation and its element references are stale: obtain a fresh observation and assess the effect before a dependent action. Do not issue a state-changing action together with a dependent mobile action, claim_done, or another conclusion in one response. One grounded mutation followed by a fresh observed turn is the default. You may batch only independent read-only tools.
+The observation supplied for this turn is the only UI grounding candidate for this turn. Prefer an identified visible element or locator over coordinates; use coordinates only when the current screenshot and geometry make the target unambiguous. Coordinate tools use integer x/y values in a logical 0..1000 by 0..1000 canvas, regardless of device resolution. Before entering text, establish the focused target from the current observation. After every state-changing Android action (tap, swipe, drag, text entry, key, or app launch), the old observation and its element references are stale: obtain a fresh observation and assess the effect before a dependent action. Do not issue a state-changing action together with a dependent mobile action, claim_done, or another conclusion in one response. One grounded mutation followed by a fresh observed turn is the default. You may batch only independent read-only tools.
 
 ## Execution loop
 
@@ -59,7 +60,7 @@ Work in a closed loop: inspect the current observation, update or follow the dur
 
 Recovery is a ladder, not blind retry: first inspect a fresh observation and the structured result; then classify the failure as a missing target, wrong screen, no effect, permission/approval, transient service failure, or verifier mismatch; then replan or choose a safe alternative; escalate only when returned evidence and authority allow it. Preserve the blocker and retry budget.
 
-Maintain an explicit plan for multi-step work. Make steps concrete, dependency-aware, and evidence-oriented. Mark progress only when evidence supports it. When a tool fails, UI drifts, verification rejects a claim, an approval pauses work, or a provider is unavailable: inspect the returned error and durable plan state, preserve the blocker, choose a safe recovery or replan, and do not fabricate success. Respect retry budgets and retry-not-before timestamps.
+For any task requiring more than one UI state change, first create a `plan` with small, concrete, dependency-aware and evidence-oriented steps. Then update its current step as evidence changes; the runtime journals each plan update and action outcome. A required-plan-update directive is a hard checkpoint: write `plan` or `todo` in its own turn before another dependent Android action or `claim_done`. State what changed using a status, evidence, or blocker; do not submit a cosmetic rewrite. Do not encode a fixed procedure from the task text into the plan: inspect the current observation, choose the smallest justified next step, and revise the plan when the UI contradicts it. When a tool fails, UI drifts, verification rejects a claim, an approval pauses work, or a provider is unavailable: inspect the returned error and durable plan state, preserve the blocker, choose a safe recovery or replan, and do not fabricate success. Respect retry budgets and retry-not-before timestamps.
 
 ## Grounding and research
 
@@ -125,19 +126,21 @@ You have native Android tools that drive a real device through its UI hierarchy,
 ## Preferred workflow
 
 1. Begin with `observe`. It returns the current activity, visible elements, accessibility labels, bounds, and replayable observation evidence. The observation belongs to the current turn only.
-2. Target a current visible element with `tap(locator=...)` whenever possible. A locator grounded in text, content description, or resource id is more reliable than coordinates. Use normalized `x`/`y` only when the current screenshot geometry makes the target unambiguous.
-3. For input, first establish the intended focused field from the observation, then call `type_text(text=...)`. Use `key` for Android keys and `swipe` or `drag` only with a current, grounded gesture path.
+2. Target a current visible element with `tap(element=N)` whenever the observation supplies a unique 1-based element index; it is the primary grounding mechanism. `tap(locator=...)` grounded in text, content description, or resource id is next best. Coordinate arguments are only a fallback and are **integers** on a 0..1000 x 0..1000 logical canvas: `(0,0)` is top-left and `(1000,1000)` is bottom-right, even when the screenshot or crop has another pixel size. Do not emit decimal coordinates.
+3. For input, first establish the intended focused field from the observation, then call `type_text(text=...)`. `key` accepts only ENTER, BACK, HOME, TAB, DEL, FORWARD_DEL, ESCAPE, SPACE, DPAD_UP, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT, DPAD_CENTER, MOVE_HOME, MOVE_END, PAGE_UP, PAGE_DOWN, VOLUME_UP, VOLUME_DOWN, or VOLUME_MUTE; BACK and HOME are key values, not separate actions. Use `swipe` or `drag` only with a current, grounded gesture path. For dense or ambiguous targets, call `zoom(x, y, ratio?)` alone: it creates a temporary crop for the next model turn and never sends a device gesture. Take the following grounded gesture in that crop. If a coordinate action misses, has no visible effect, or remains ambiguous after a fresh observation, do not repeat or nudge the coordinate: call `zoom` around the best current 0..1000 estimate, inspect the crop, then issue one refined coordinate action.
 4. After every state-changing action, call `observe` again before any dependent action. A new observation invalidates references from earlier UI snapshots. Do not combine a mutation with a dependent tap, text entry, evidence claim, or `claim_done` in one response.
 
 ## Verify -> recover ladder
 
 The tool result tells you whether the runtime dispatched the action, not that the requested UI effect occurred. Treat a successful action result as **executed but unverified** until a fresh observation supports the expected effect.
 
+Every Android mutation also produces a structured `action_outcome` on the next turn. Read it before selecting another mutation: `dispatched=true` is only transport success. If its effect is `unverifiable`, inspect the post-action observation before continuing or retrying. If its effect is `suspected_noop`, follow its `verdict.recommended` recovery—typically `zoom` for a coordinate gesture—rather than repeating or nudging the coordinate. Only `verified=true` is evidence that the specific UI effect occurred; it is still not task completion.
+
 - If the fresh observation shows the expected state, continue; never repeat successful input just because an earlier screen was stale.
 - If the target is absent, the app is on a different screen, the result is ambiguous, or the state is unchanged, inspect the fresh activity/elements and classify the cause before trying again.
-- If a locator did not resolve or a current target is not exposed in the hierarchy, use the current screenshot geometry as a last-resort coordinate grounding. Do not reuse old coordinates.
+- If a locator did not resolve or a current target is not exposed in the hierarchy, use the current screenshot geometry as a last-resort coordinate grounding. Use integer 0..1000 coordinates and do not reuse old coordinates. For a small, dense, uncertain, or previously missed coordinate target, zoom before the next coordinate action.
 - If an action requires approval, stop at that boundary. Approval is not evidence that the action succeeded; after approval and replay, observe again.
-- If a permitted recovery action such as Back, Home, app launch, wait, or a different plan step is justified by the observed state, take the smallest such action. Do not loop the same gesture expecting a different outcome.
+- If a permitted recovery action such as `key(BACK)`, `key(HOME)`, app launch, wait, or a different plan step is justified by the observed state, take the smallest such action. Do not loop the same gesture expecting a different outcome.
 - If repeated fresh observations cannot establish a safe next action, preserve the blocker in the plan and ask for the missing user decision or device access. Do not claim the device is unsupported without evidence from the returned tool result.
 
 ## Observation scope and action order
@@ -167,10 +170,10 @@ This runtime uses `memory`, `session_search`, `skills_list`, `skill_view`, and `
     # operating instructions.
     STABLE = CORE_STABLE
 
-    def __init__(self, max_context_tokens: int = 8_000, token_counter: Callable[[str], int] | None = None,
+    def __init__(self, max_context_tokens: int = 200_000, token_counter: Callable[[str], int] | None = None,
                  tokenizer_name: str = "approximate_chars",
                  summary_hook: Callable[[dict[str, Any]], str] | None = None,
-                 model_family: str = "gpt") -> None:
+                 model_family: str = "gpt", summary_timeout_seconds: float = 20.0) -> None:
         self.max_context_tokens = max_context_tokens
         self.token_counter, self.tokenizer_name = token_counter, tokenizer_name
         self._session_parts: dict[str, PromptParts] = {}
@@ -179,6 +182,8 @@ This runtime uses `memory`, `session_search`, `skills_list`, `skill_view`, and `
         # completion state, which remain represented separately in the checkpoint.
         self.summary_hook = summary_hook
         self.model_family = model_family.casefold()
+        self.summary_timeout_seconds = summary_timeout_seconds
+        self.last_compaction_error = ""
 
     def _tokens(self, value: Any) -> int:
         """Use a configured model tokenizer; otherwise label the fallback estimate."""
@@ -194,9 +199,12 @@ This runtime uses `memory`, `session_search`, `skills_list`, `skill_view`, and `
             "prompt_version": self.version,
             "task": state.task,
             "workspace_root": state.workspace_root,
-            "plan": [asdict(step) for step in state.plan],
+            "plan": self._plan_for_context(state),
+            "plan_revision": int(getattr(state, "plan_revision", 0)),
+            "persistent_memory": [item.to_dict() for item in broker.memory.snapshot()] if getattr(broker, "memory", None) else [],
             "turn_directives": self._turn_directives(state, {item.name for item in broker.manifest()}),
             "observation": self._observation_context(state.observation),
+            "action_outcome": dict(getattr(state, "action_outcome", None) or {}),
             "recent_events": recent_events,
             "recent_tool_outputs": tool_outputs,
             "summary": state.summary,
@@ -228,6 +236,25 @@ This runtime uses `memory`, `session_search`, `skills_list`, `skill_view`, and `
                                      "trimmed_blocks": trimmed, "overflow_tokens": max(0, used - self.max_context_tokens)}
         return parts.joined, context
 
+    @staticmethod
+    def _plan_for_context(state: Any) -> list[dict[str, Any]]:
+        """After compaction, inject only unfinished work plus needed parents.
+
+        This mirrors Hermes TodoStore's post-compression handoff and prevents
+        completed work from being treated as a fresh instruction.
+        """
+        steps = list(getattr(state, "plan", ()))
+        if "COMPACTION_CHECKPOINT=" not in str(getattr(state, "summary", "")):
+            return [asdict(step) for step in steps]
+        active_ids = {step.id for step in steps if step.status not in {"completed", "cancelled"}}
+        changed = True
+        while changed:
+            changed = False
+            for step in steps:
+                if step.id in active_ids and step.parent and step.parent not in active_ids:
+                    active_ids.add(step.parent); changed = True
+        return [asdict(step) for step in steps if step.id in active_ids]
+
     def render_parts(self, state: Any, broker: Any) -> PromptParts:
         """Build once per session; rebuild only after compaction/restore.
 
@@ -249,7 +276,7 @@ This runtime uses `memory`, `session_search`, `skills_list`, `skill_view`, and `
             stable.append(self.GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
         if names:
             stable.append(self.MOBILE_TOOL_NAME_MAPPING)
-        if names & {"tap", "swipe", "drag", "type_text", "key", "back", "home", "launch_app"}:
+        if names & {"tap", "swipe", "drag", "type_text", "key", "launch_app"}:
             stable.append(self.MOBILE_USE_GUIDANCE)
         if "memory" in names:
             stable.append(self.MEMORY_GUIDANCE)
@@ -289,9 +316,11 @@ This runtime uses `memory`, `session_search`, `skills_list`, `skill_view`, and `
             "surface": "android",
             "observation_freshness": "Current only for this turn; every Android mutation invalidates its element references.",
             "mobile_action_sequence": "Ground one mutation, then obtain a fresh observation before dependent action or completion claim.",
+            "post_action_contract": "For every Android mutation, read action_outcome. dispatched=true is not success: obey its verdict. suspected_noop requires the recommended recovery before another coordinate retry; unverifiable requires inspection of the captured post-action state.",
             "recovery_ladder": ["inspect fresh state", "classify structured failure", "replan or choose safe alternative", "escalate only with evidence and authority"],
             "memory_recall": [name for name in ("session_search", "memory_search", "skill_search") if name in names],
             "active_step_ids": active,
+            "plan_update_required": dict(getattr(state, "plan_update_required", None) or {}),
         }
 
     @classmethod
@@ -369,18 +398,29 @@ This runtime uses `memory`, `session_search`, `skills_list`, `skill_view`, and `
             results.append({"path": name, "content": sanitized, "trust": "untrusted_workspace_context", "source_delimiter": "BEGIN_UNTRUSTED_WORKSPACE_CONTEXT", "source_end_delimiter": "END_UNTRUSTED_WORKSPACE_CONTEXT", "scan_findings": [item.to_dict() for item in findings]})
         return results
 
-    def compact_if_needed(self, state: Any, limit: int = 80, context_budget: int | None = None) -> bool:
-        if len(state.events) <= limit and (context_budget is None or self._tokens([asdict(event) for event in state.events]) <= context_budget // 2):
+    def compact_if_needed(self, state: Any, limit: int | None = None, context_budget: int | None = None) -> bool:
+        self.last_compaction_error = ""
+        event_tokens = self._tokens([asdict(event) for event in state.events]) if context_budget is not None else 0
+        below_event_limit = limit is None or len(state.events) <= limit
+        below_context_limit = context_budget is None or event_tokens <= context_budget
+        if below_event_limit and below_context_limit:
             return False
-        keep = min(24, max(4, limit // 3))
-        old, state.events[:] = state.events[:-keep], state.events[-keep:]
+        # Preserve a protected beginning (task/session contract) and priority
+        # tail. Build the replacement first; do not mutate live state until the
+        # handoff checkpoint is complete.
+        tail = min(24, max(4, (limit // 3) if limit is not None else 24))
+        # Explicit count compaction is a test/manual maintenance operation;
+        # budget-driven runtime compaction gets Hermes's protected task head.
+        head = min(4, max(0, len(state.events) - tail)) if limit is None else 0
+        old = state.events[head:-tail] if len(state.events) > head + tail else []
+        retained = state.events[:head] + state.events[-tail:]
         important = []
         for event in old:
             if event.kind in {"verification", "replan", "blocked", "failed", "approval_resolved", "memory_curated"}:
                 important.append({"kind": event.kind, "payload": event.payload})
             elif event.kind == "tool_result" and not event.payload.get("result", {}).get("ok", True):
                 important.append({"kind": "failed_tool", "payload": event.payload})
-        active = [{"id": step.id, "description": step.description, "status": step.status, "evidence": step.evidence, "blocker": step.blocker, "attempts": step.attempts, "budget": step.budget, "depends_on": step.depends_on, "retry_not_before": step.retry_not_before} for step in state.plan if step.status != "completed"]
+        active = [{"id": step.id, "description": step.description, "status": step.status, "evidence": step.evidence, "blocker": step.blocker, "attempts": step.attempts, "budget": step.budget, "depends_on": step.depends_on, "retry_not_before": step.retry_not_before, "parent": step.parent} for step in state.plan if step.status not in {"completed", "cancelled"}]
         previous = self._checkpoint(state.summary)
         checkpoint = {
             "version": 1,
@@ -394,13 +434,19 @@ This runtime uses `memory`, `session_search`, `skills_list`, `skill_view`, and `
             "context_budget": context_budget,
         }
         narrative = self._narrative_summary(state, old, checkpoint)
+        # A configured auxiliary summarizer is part of the transaction: if it
+        # fails or stalls, preserve the original event list for a later retry.
+        if self.summary_hook and narrative is None:
+            return False
         if narrative:
             checkpoint["narrative"] = narrative
         # Keep one structured checkpoint rather than recursively growing summaries.
-        state.summary = (narrative + "\n" if narrative else "") + "COMPACTION_CHECKPOINT=" + json.dumps(checkpoint, ensure_ascii=False)
+        summary = (narrative + "\n" if narrative else "") + "COMPACTION_CHECKPOINT=" + json.dumps(checkpoint, ensure_ascii=False)
+        state.events[:] = retained
+        state.summary = summary
         return True
 
-    def _narrative_summary(self, state: Any, old: list[Any], checkpoint: dict[str, Any]) -> str:
+    def _narrative_summary(self, state: Any, old: list[Any], checkpoint: dict[str, Any]) -> str | None:
         """Produce a bounded semantic trajectory summary with deterministic fallback."""
         source = {
             "task": getattr(state, "task", ""),
@@ -412,14 +458,27 @@ This runtime uses `memory`, `session_search`, `skills_list`, `skill_view`, and `
         }
         if self.summary_hook:
             try:
-                generated = self.summary_hook(source)
+                # The hook receives only the staged extract; a late worker can
+                # never alter the live session after a timeout.
+                executor = ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(self.summary_hook, source)
+                try:
+                    generated = future.result(timeout=self.summary_timeout_seconds)
+                finally:
+                    # Do not wait for a stalled auxiliary worker. It only owns
+                    # the staged source extract, never live session state.
+                    executor.shutdown(wait=False, cancel_futures=True)
                 if isinstance(generated, str) and generated.strip():
                     sanitized, _ = scan_and_sanitize(generated, max_chars=2_000)
                     return sanitized.strip()[:2_000]
-            except Exception:
-                # Compaction must never block a durable agent turn because an
-                # optional summarizer is unavailable or malformed.
-                pass
+                self.last_compaction_error = "summary hook returned no usable summary"
+                return None
+            except FutureTimeout:
+                self.last_compaction_error = "summary hook timed out; live context was preserved"
+                return None
+            except Exception as exc:
+                self.last_compaction_error = f"summary hook failed: {exc}"
+                return None
         previous = self._checkpoint(getattr(state, "summary", {})).get("narrative", "")
         return str(previous).strip()[:2_000]
 

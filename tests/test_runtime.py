@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import shutil
 import unittest
+import io
+import json
 from pathlib import Path
 
 from mobile_harness.memory import CuratedMemory, CuratedMemoryStore, SkillStore
@@ -39,15 +41,198 @@ class RuntimeTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
+    def test_auto_approval_setting_is_limited_to_mobile_authority_categories(self):
+        auto_approve_mobile_actions = True
+        authority = AuthorityBroker(
+            approve=lambda category, _: auto_approve_mobile_actions and category.startswith("mobile_")
+        )
+
+        self.assertTrue(authority.check("mobile_consequential", "tap a purchase button").allowed)
+        self.assertFalse(authority.check("workspace_write", "edit a file").allowed)
+        self.assertFalse(authority.check("command", "run a shell command").allowed)
+
     def test_plan_mobile_action_and_verified_replayable_session(self):
         root = self.root
         device = Device(); broker = ToolBroker(device, root, memory=CuratedMemoryStore(root / "memory"), skills=SkillStore(root / "skills"))
-        model = Model([[ToolCall("plan", {"steps": [{"id": "1", "description": "continue", "status": "in_progress"}]}), ToolCall("tap", {"locator": {"text": "Continue"}})], [ToolCall("claim_done", {"reason": "visible"})]])
+        model = Model([[ToolCall("plan", {"steps": [{"id": "1", "description": "continue", "status": "in_progress"}]} )], [ToolCall("tap", {"locator": {"text": "Continue"}})], [ToolCall("claim_done", {"reason": "visible"})]])
         runtime = MobileAgentRuntime(model, broker, Verifier(), SessionStore(root / "sessions"))
         state = runtime.run(runtime.start("continue", root))
         self.assertEqual(state.status, "verified")
         self.assertEqual(len(device.actions), 1)
         self.assertEqual(runtime.store.load(state.id).status, "verified")
+
+    def test_configured_runtime_requires_a_separate_durable_plan_before_mobile_action(self):
+        device = Device()
+        runtime = MobileAgentRuntime(Model([]), ToolBroker(device, self.root), Verifier(), SessionStore(self.root / "sessions"), require_plan_before_mutation=True)
+        state = runtime.start("complete a multistep task", self.root)
+        rejected = runtime._execute_calls([ToolCall("tap", {"element": 1})], state, device.observe())[0][1]
+        self.assertFalse(rejected.ok)
+        self.assertIn("create a durable plan", rejected.error)
+        planned = runtime._execute_calls([ToolCall("plan", {"steps": [{"id": "1", "description": "continue", "status": "in_progress"}]})], state, device.observe())[0][1]
+        self.assertTrue(planned.ok)
+        self.assertEqual(state.plan_revision, 1)
+
+    def test_transition_gate_requires_a_live_model_plan_update_before_claim(self):
+        class ChangingDevice(Device):
+            def act(self, action, observation):
+                self.actions.append(action)
+                self.observation = Observation(100, 200, elements=(UIElement(Rect(40, 40, 80, 80), text="Completed", clickable=True),))
+                return ActionResult(True, "dispatched")
+
+        model = Model([
+            [ToolCall("plan", {"steps": [{"id": "act", "description": "tap Continue", "status": "in_progress"}]})],
+            [ToolCall("tap", {"locator": {"text": "Continue"}})],
+            [ToolCall("plan", {"action": "update", "id": "act", "status": "completed", "evidence": "Completed is visible"})],
+            [ToolCall("claim_done", {"reason": "Completed is visible"})],
+        ])
+        runtime = MobileAgentRuntime(model, ToolBroker(ChangingDevice(), self.root), Verifier(), SessionStore(self.root / "sessions"), max_turns=4, require_plan_update_on_transition=True)
+        state = runtime.run(runtime.start("continue", self.root))
+        self.assertEqual(state.status, "verified")
+        self.assertEqual(state.plan_revision, 2)
+        required = [event for event in state.events if event.kind == "plan_update_required"]
+        self.assertTrue(required)
+        update = [event for event in state.events if event.kind == "plan_updated"][-1]
+        self.assertEqual(update.payload["satisfied_requirement"]["trigger"], "post_action_assessment")
+
+    def test_recovery_gate_is_durable_and_requires_model_authored_update(self):
+        runtime = MobileAgentRuntime(Model([]), ToolBroker(Device(), self.root), Verifier(), SessionStore(self.root / "sessions"), require_plan_update_on_transition=True)
+        state = runtime.start("recover", self.root)
+        state.plan = [__import__("mobile_harness").PlanStep("a", "retry", "in_progress")]
+        runtime._recover(state, "network timeout")
+        self.assertEqual(state.plan_update_required["trigger"], "recovery")
+        blocked = runtime._execute_calls([ToolCall("claim_done")], state, Device().observe())[0][1]
+        self.assertFalse(blocked.ok)
+        self.assertIn("write a durable plan or todo update", blocked.error)
+
+    def test_mobile_action_has_hermes_style_post_action_outcome_and_fresh_evidence(self):
+        class ChangingDevice(Device):
+            def act(self, action, observation):
+                self.actions.append(action)
+                self.observation = Observation(100, 200, elements=(UIElement(Rect(40, 40, 80, 80), text="Address bar focused", clickable=True),))
+                return ActionResult(True, "dispatched")
+
+        class InspectingModel:
+            def __init__(self): self.contexts = []
+            def respond(self, *, context, **_):
+                self.contexts.append(context)
+                return "", [ToolCall("tap", {"x": 500, "y": 500})] if len(self.contexts) == 1 else [ToolCall("claim_done")]
+
+        device, model = ChangingDevice(), InspectingModel()
+        runtime = MobileAgentRuntime(model, ToolBroker(device, self.root), Verifier(), SessionStore(self.root / "sessions"), max_turns=2)
+        state = runtime.run(runtime.start("focus field", self.root))
+        outcome = next(event.payload for event in state.events if event.kind == "action_outcome")
+        self.assertEqual(outcome["effect"], "unverifiable")
+        self.assertEqual(outcome["verdict"]["decision"], "verify_fresh_state")
+        self.assertIn("after_evidence", outcome)
+        self.assertEqual(model.contexts[1]["action_outcome"]["effect"], "unverifiable")
+
+    def test_unchanged_coordinate_action_recommends_zoom_not_blind_retry(self):
+        device = Device()
+        runtime = MobileAgentRuntime(Model([[ToolCall("tap", {"x": 500, "y": 500})], [ToolCall("claim_done")]]), ToolBroker(device, self.root), Verifier(), SessionStore(self.root / "sessions"), max_turns=2)
+        state = runtime.run(runtime.start("tap target", self.root))
+        outcome = next(event.payload for event in state.events if event.kind == "action_outcome")
+        self.assertEqual(outcome["effect"], "suspected_noop")
+        self.assertEqual(outcome["verdict"]["decision"], "escalate")
+        self.assertEqual(outcome["verdict"]["recommended"], "zoom")
+
+    def test_ui_tree_change_overrides_identical_screenshot_noop_signal(self):
+        class SemanticChangingDevice(Device):
+            def __init__(self):
+                super().__init__()
+                self.observation = Observation(100, 200, screenshot_png=b"same-pixels", ui_xml="<screen><field focused='false'/></screen>")
+
+            def act(self, action, observation):
+                self.actions.append(action)
+                self.observation = Observation(100, 200, screenshot_png=b"same-pixels", ui_xml="<screen><field focused='true'/></screen>")
+                return ActionResult(True, "dispatched")
+
+        device = SemanticChangingDevice()
+        runtime = MobileAgentRuntime(Model([[ToolCall("tap", {"x": 500, "y": 500})], [ToolCall("claim_done")]]), ToolBroker(device, self.root), Verifier(), SessionStore(self.root / "sessions"), max_turns=2)
+        state = runtime.run(runtime.start("focus field", self.root))
+        outcome = next(event.payload for event in state.events if event.kind == "action_outcome")
+        self.assertEqual(outcome["effect"], "unverifiable")
+        self.assertEqual(outcome["verdict"]["decision"], "verify_fresh_state")
+
+    def test_zoom_is_a_one_turn_durable_view_then_clears_after_mobile_action(self):
+        from PIL import Image
+        image = Image.new("RGB", (100, 200), "white")
+        encoded = io.BytesIO(); image.save(encoded, format="PNG")
+        device = Device(); device.observation = Observation(100, 200, screenshot_png=encoded.getvalue())
+        broker = ToolBroker(device, self.root, zoom_ratio=.5)
+        model = Model([[ToolCall("zoom", {"x": 500, "y": 500})], [ToolCall("tap", {"x": 500, "y": 500})], [ToolCall("claim_done")]])
+        runtime = MobileAgentRuntime(model, broker, Verifier(), SessionStore(self.root / "sessions"), max_turns=3)
+        state = runtime.run(runtime.start("refine target", self.root))
+        self.assertEqual(state.status, "verified")
+        self.assertIsNone(state.zoom_view)
+        self.assertEqual([action.kind.value for action in device.actions], ["tap"])
+        zoom_event = next(event for event in state.events if event.kind == "tool_result" and event.payload["call"]["name"] == "zoom")
+        self.assertEqual(zoom_event.payload["result"]["content"]["viewport"], {"left": 25, "top": 50, "width": 50, "height": 100})
+
+    def test_zoom_cannot_share_a_turn_with_another_tool(self):
+        from PIL import Image
+        image = Image.new("RGB", (100, 200), "white")
+        encoded = io.BytesIO(); image.save(encoded, format="PNG")
+        device = Device(); device.observation = Observation(100, 200, screenshot_png=encoded.getvalue())
+        runtime = MobileAgentRuntime(Model([[ToolCall("zoom", {"x": 500, "y": 500}), ToolCall("tap", {"x": 500, "y": 500})]]), ToolBroker(device, self.root), Verifier(), SessionStore(self.root / "sessions"), max_turns=1)
+        state = runtime.run(runtime.start("bad batch", self.root))
+        self.assertEqual(device.actions, [])
+        self.assertTrue(any(event.kind == "replan" and "zoom must be the only" in event.payload["reason"] for event in state.events))
+
+    def test_runtime_schema_documents_zoom_and_closed_key_vocabulary(self):
+        schemas = {item["function"]["name"]: item["function"] for item in ToolBroker(Device(), self.root).schemas()}
+        self.assertEqual(schemas["zoom"]["parameters"]["required"], ["x", "y"])
+        self.assertEqual(schemas["tap"]["parameters"]["properties"]["x"], {"type": "integer", "minimum": 0, "maximum": 1000, "description": "Integer x on the current 0..1000 logical screenshot."})
+        self.assertIn("BACK", schemas["key"]["parameters"]["properties"]["key"]["enum"])
+        self.assertNotIn("back", schemas)
+        self.assertNotIn("home", schemas)
+
+    def test_runtime_1000_space_is_converted_once_before_device_dispatch(self):
+        device = Device()
+        broker = ToolBroker(device, self.root)
+        result = broker.execute(ToolCall("tap", {"x": 500, "y": 250}), object(), device.observe())
+        self.assertTrue(result.ok)
+        self.assertEqual((device.actions[0].x, device.actions[0].y), (.5, .25))
+        rejected = broker.execute(ToolCall("tap", {"x": .5, "y": 250}), object(), device.observe())
+        self.assertFalse(rejected.ok)
+        self.assertIn("integer", rejected.error)
+
+    def test_runtime_prefers_current_one_based_element_index_over_coordinates(self):
+        device = Device()
+        broker = ToolBroker(device, self.root)
+        payload = broker.observation_payload(device.observe())
+        self.assertEqual(payload["elements"][0]["index"], 1)
+        result = broker.execute(ToolCall("tap", {"element": 1}), object(), device.observe())
+        self.assertTrue(result.ok)
+        self.assertEqual((device.actions[0].x, device.actions[0].y), (.15, .05))
+        invalid = broker.execute(ToolCall("tap", {"element": 2}), object(), device.observe())
+        self.assertFalse(invalid.ok)
+        self.assertIn("1-based", invalid.error)
+
+    def test_mobile_prompt_requires_zoom_after_an_ambiguous_coordinate_attempt(self):
+        from mobile_harness.prompts import PromptAssembler
+        self.assertIn("If a coordinate action misses", PromptAssembler.MOBILE_USE_GUIDANCE)
+        self.assertIn("0..1000", PromptAssembler.MOBILE_USE_GUIDANCE)
+
+    def test_runtime_passes_zoom_crop_to_model_without_persisting_image_data(self):
+        from PIL import Image
+        class InspectingModel:
+            def __init__(self): self.images = []
+            def respond(self, *, context, **_):
+                self.images.append(context.get("current_screen_image"))
+                return "", [ToolCall("zoom", {"x": 500, "y": 500})] if len(self.images) == 1 else [ToolCall("claim_done")]
+        image = Image.new("RGB", (100, 200), "white")
+        encoded = io.BytesIO(); image.save(encoded, format="PNG")
+        device = Device(); device.observation = Observation(100, 200, screenshot_png=encoded.getvalue())
+        model = InspectingModel()
+        store = SessionStore(self.root / "sessions")
+        runtime = MobileAgentRuntime(model, ToolBroker(device, self.root), Verifier(), store, max_turns=2)
+        state = runtime.run(runtime.start("inspect crop", self.root))
+        self.assertEqual(state.status, "verified")
+        self.assertEqual(len(model.images), 2)
+        self.assertTrue(all(image and image.startswith("data:image/png;base64,") for image in model.images))
+        self.assertNotEqual(model.images[0], model.images[1])
+        snapshot = (store.root / f"{state.id}.json").read_text(encoding="utf-8")
+        self.assertNotIn("data:image/png;base64", snapshot)
 
     def test_session_lease_fails_closed_on_contention_then_releases(self):
         store = SessionStore(self.root / "sessions")
@@ -188,6 +373,49 @@ class RuntimeTests(unittest.TestCase):
         model = OpenAIResponsesRuntimeModel("https://example.invalid/v1", "key", "model", post=lambda *_: response)
         _, calls = model.respond(system="x", context={}, tools=[])
         self.assertEqual([call.name for call in calls], ["observe", "tap"])
+
+    def test_chat_adapter_streams_tool_calls_and_emits_timing(self):
+        from unittest.mock import patch
+        from mobile_harness.providers import OpenAIChatRuntimeModel
+
+        class StreamResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def __iter__(self):
+                chunks = [
+                    {"choices": [{"delta": {"content": "Thinking"}}]},
+                    {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "observe", "arguments": "{}"}}]}}]},
+                    {"choices": [{"delta": {}}]},
+                ]
+                for chunk in chunks:
+                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+
+        events = []
+        with patch("mobile_harness.providers.request.urlopen", return_value=StreamResponse()) as opened:
+            model = OpenAIChatRuntimeModel("https://example.invalid/v1", "key", "model")
+            text, calls = model.respond(system="x", context={}, tools=[], on_event=lambda kind, payload: events.append((kind, payload)))
+        self.assertEqual(text, "Thinking")
+        self.assertEqual([(call.name, call.arguments) for call in calls], [("observe", {})])
+        self.assertEqual([kind for kind, _ in events], ["request_started", "first_delta", "request_completed"])
+        payload = json.loads(opened.call_args.args[0].data.decode())
+        self.assertTrue(payload["stream"])
+        self.assertEqual(opened.call_args.kwargs["timeout"], 150.0)
+
+    def test_runtime_journals_provider_stream_timing(self):
+        class StreamModel:
+            def respond(self, *, on_event, **_):
+                on_event("request_started", {"streaming": True})
+                on_event("first_delta", {"elapsed_seconds": 1.25})
+                on_event("request_completed", {"elapsed_seconds": 2.5, "tool_count": 1})
+                return "", [ToolCall("observe")]
+
+        runtime = MobileAgentRuntime(StreamModel(), ToolBroker(Device(), self.root), Verifier(), SessionStore(self.root / "sessions"), max_turns=1)
+        state = runtime.run(runtime.start("inspect", self.root))
+        kinds = [event.kind for event in state.events]
+        self.assertIn("model_request_started", kinds)
+        self.assertIn("model_first_delta", kinds)
+        self.assertIn("model_request_completed", kinds)
 
     def test_history_search_survives_compacted_snapshot(self):
         store = SessionStore(self.root / "sessions")
@@ -398,6 +626,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('"compaction_count": 2', state.summary)
         self.assertLessEqual(len(state.events), 4)
 
+    def test_runtime_budget_compaction_without_event_limit_keeps_hermes_bounded_tail(self):
+        from mobile_harness.prompts import PromptAssembler
+        from mobile_harness.runtime import RuntimeEvent
+        state = type("State", (), {"events": [RuntimeEvent(i, "tool_result", {"result": {"ok": True}}) for i in range(1, 90)], "plan": [], "verifier_evidence": [], "summary": ""})()
+        self.assertTrue(PromptAssembler(max_context_tokens=1).compact_if_needed(state, limit=None, context_budget=1))
+        self.assertEqual(len(state.events), 28)  # 4 protected head + 24 priority tail
+        self.assertIn("COMPACTION_CHECKPOINT=", state.summary)
+
+    def test_auxiliary_compaction_failure_preserves_live_journal_transactionally(self):
+        from mobile_harness.prompts import PromptAssembler
+        from mobile_harness.runtime import RuntimeEvent
+        state = type("State", (), {"events": [RuntimeEvent(i, "replan", {"reason": "x" * 200}) for i in range(1, 40)], "plan": [], "verifier_evidence": [], "summary": "before"})()
+        original = list(state.events)
+        prompts = PromptAssembler(max_context_tokens=1, summary_hook=lambda _: (_ for _ in ()).throw(RuntimeError("offline")))
+        self.assertFalse(prompts.compact_if_needed(state, limit=None, context_budget=1))
+        self.assertEqual(state.events, original)
+        self.assertEqual(state.summary, "before")
+        self.assertIn("summary hook failed", prompts.last_compaction_error)
+
     def test_prompt_uses_configured_exact_counter_and_reports_trims(self):
         from mobile_harness.prompts import PromptAssembler
         counter = lambda text: len(text.split())
@@ -456,6 +703,8 @@ class RuntimeTests(unittest.TestCase):
         broker = ToolBroker(Device(), self.root)
         written = broker.execute(ToolCall("todo", {"todos": [{"id": "observe", "content": "Observe the Android UI", "status": "in_progress"}]}), state, Device().observe())
         self.assertTrue(written.ok)
+        self.assertEqual(written.content["revision"], 1)
+        self.assertEqual(written.content["summary"]["in_progress"], 1)
         self.assertEqual(state.plan[0].description, "Observe the Android UI")
         current = broker.execute(ToolCall("todo"), state, Device().observe())
         self.assertEqual(current.content["todos"][0]["status"], "in_progress")
@@ -516,12 +765,15 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("blocked-untrusted-instruction", state.summary)
         self.assertIn('"narrative"', state.summary)
 
-    def test_compaction_summary_hook_failure_keeps_structured_checkpoint(self):
+    def test_compaction_summary_hook_failure_preserves_live_context(self):
         from mobile_harness.prompts import PromptAssembler
         from mobile_harness.runtime import RuntimeEvent
         state = type("State", (), {"events": [RuntimeEvent(i, "tool_result", {}) for i in range(1, 90)], "plan": [], "verifier_evidence": [], "summary": ""})()
-        PromptAssembler(summary_hook=lambda source: (_ for _ in ()).throw(RuntimeError("offline"))).compact_if_needed(state, limit=10)
-        self.assertIn("COMPACTION_CHECKPOINT=", state.summary)
+        original = list(state.events)
+        prompts = PromptAssembler(summary_hook=lambda source: (_ for _ in ()).throw(RuntimeError("offline")))
+        self.assertFalse(prompts.compact_if_needed(state, limit=10))
+        self.assertEqual(state.events, original)
+        self.assertEqual(state.summary, "")
 
     def test_recovery_moves_to_next_plan_step_with_classification(self):
         root = self.root
@@ -580,6 +832,32 @@ class RuntimeTests(unittest.TestCase):
         broker.execute(ToolCall("plan", {"action": "update", "id": "observe", "status": "completed", "evidence": "seen"}), state, Device().observe())
         runtime._recover(state, "network timeout")
         self.assertEqual(next(step for step in state.plan if step.id == "tap").status, "in_progress")
+
+    def test_plan_accepts_dependencies_alias_and_preserves_it_canonically(self):
+        state = MobileAgentRuntime(Model([]), ToolBroker(Device(), self.root), Verifier(), SessionStore(self.root / "sessions")).start("dependency alias", self.root)
+        result = ToolBroker(Device(), self.root).execute(ToolCall("plan", {"action": "set", "steps": [{"id": "observe", "description": "inspect", "status": "in_progress"}, {"id": "act", "description": "act", "dependencies": ["observe"]}]}), state, Device().observe())
+        self.assertTrue(result.ok)
+        self.assertEqual(next(step for step in state.plan if step.id == "act").depends_on, ("observe",))
+
+    def test_plan_supports_hermes_style_bounded_parent_subtasks(self):
+        state = MobileAgentRuntime(Model([]), ToolBroker(Device(), self.root), Verifier(), SessionStore(self.root / "sessions")).start("nested plan", self.root)
+        result = ToolBroker(Device(), self.root).execute(ToolCall("plan", {"action": "set", "steps": [{"id": "parent", "description": "parent", "status": "in_progress"}, {"id": "child", "description": "child", "parent": "parent"}]}), state, Device().observe())
+        self.assertTrue(result.ok)
+        self.assertEqual(next(step for step in state.plan if step.id == "child").parent, "parent")
+
+    def test_plan_rejects_parent_cycles(self):
+        state = MobileAgentRuntime(Model([]), ToolBroker(Device(), self.root), Verifier(), SessionStore(self.root / "sessions")).start("cyclic parents", self.root)
+        result = ToolBroker(Device(), self.root).execute(ToolCall("plan", {"action": "set", "steps": [{"id": "a", "description": "a", "parent": "b"}, {"id": "b", "description": "b", "parent": "a"}]}), state, Device().observe())
+        self.assertFalse(result.ok)
+        self.assertIn("parent relationships contain a cycle", result.error)
+
+    def test_promoted_memory_is_injected_as_bounded_runtime_context(self):
+        from mobile_harness.prompts import PromptAssembler
+        memory = CuratedMemoryStore(self.root / "memory")
+        memory.promote(CuratedMemory("User prefers durable plans", "preference", "reviewed"), verified=True, reviewed=True)
+        state = MobileAgentRuntime(Model([]), ToolBroker(Device(), self.root, memory=memory), Verifier(), SessionStore(self.root / "sessions")).start("remember", self.root)
+        _, context = PromptAssembler().render(state, ToolBroker(Device(), self.root, memory=memory))
+        self.assertEqual(context["persistent_memory"][0]["summary"], "User prefers durable plans")
 
     def test_plan_rejects_cyclic_dependencies(self):
         state = MobileAgentRuntime(Model([]), ToolBroker(Device(), self.root), Verifier(), SessionStore(self.root / "sessions")).start("cycle", self.root)

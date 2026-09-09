@@ -3,9 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from .model import Action, ActionKind, Observation
-
-SENSITIVE_TERMS = ("password", "permission", "allow", "payment", "checkout", "purchase", "send", "submit")
+from .config import PolicySettings, load_harness_config
+from .model import Action, Observation
 
 
 @dataclass(frozen=True)
@@ -18,21 +17,26 @@ class PolicyDecision:
 class DevicePolicy:
     """Fail closed on sensitive UI; embedding apps may explicitly approve an action."""
 
-    def __init__(self, approve: Callable[[Action, Observation, str], bool] | None = None) -> None:
+    def __init__(
+        self,
+        approve: Callable[[Action, Observation, str], bool] | None = None,
+        settings: PolicySettings | None = None,
+    ) -> None:
         self._approve = approve
+        settings = settings or load_harness_config().policy
+        self._sensitive_terms = settings.sensitive_terms
+        self._guarded_action_kinds = settings.guarded_action_kinds
 
     def check(self, action: Action, observation: Observation) -> PolicyDecision:
         visible = " ".join(item for element in observation.elements for item in (element.text, element.content_desc)).lower()
-        if action.kind in {ActionKind.TAP, ActionKind.TYPE_TEXT, ActionKind.KEY}:
-            term = next((term for term in SENSITIVE_TERMS if term in visible), None)
+        if action.kind.value in self._guarded_action_kinds:
+            term = next((term for term in self._sensitive_terms if term in visible), None)
             if term:
                 reason = f"sensitive UI detected: {term}"
                 if self._approve and self._approve(action, observation, reason):
                     return PolicyDecision(True, reason, needs_approval=True)
                 return PolicyDecision(False, reason, needs_approval=True)
         return PolicyDecision(True)
-
-
 class AuthorityBroker:
     """Cross-tool consequence policy; approval is resolved explicitly by runtime clients."""
 

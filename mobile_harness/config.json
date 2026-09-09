@@ -1,0 +1,39 @@
+{
+  "model": {
+    "name": null,
+    "base_url": null
+  },
+  "device": {
+    "serial": null,
+    "adb_timeout_seconds": 15
+  },
+  "harness": {
+    "max_steps": 100,
+    "trace_path": "mobile_harness_trace.jsonl",
+    "zoom_ratio": 0.5
+  },
+  "runtime": {
+    "provider": "chat_completions",
+    "max_turns": 40,
+    "session_root": "sessions",
+    "workspace_root": ".",
+    "capture_after_actions": true,
+    "require_plan_before_actions": true,
+    "require_plan_update_on_transition": true,
+    "context_window_tokens": 200000,
+    "memory_root": "memory",
+    "skills_root": "skills",
+    "compaction_summary_timeout_seconds": 20,
+    "model_stale_timeout_seconds": 150,
+    "model_streaming": true,
+    "model_stream_progress_interval_seconds": 15
+  },
+  "authority": {
+    "auto_approve_mobile_actions": true
+  },
+  "policy": {
+    "sensitive_terms": [
+    ],
+    "guarded_action_kinds": ["tap", "type_text", "key"]
+  }
+}

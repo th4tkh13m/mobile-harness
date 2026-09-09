@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from .model import ActionResult, Decision, Observation
+from .model import ActionKind, ActionResult, Decision, Observation
 from .policy import DevicePolicy
 from .ports import DevicePort, resolve_tap
 
@@ -35,12 +35,15 @@ class HarnessResult:
 class Harness:
     """Observe -> one policy-gated action -> re-observe -> verify terminal claims."""
 
-    def __init__(self, device: DevicePort, verifier: Verifier, policy: DevicePolicy | None = None, max_steps: int = 30, trace: object | None = None) -> None:
+    def __init__(self, device: DevicePort, verifier: Verifier, policy: DevicePolicy | None = None, max_steps: int = 30, trace: object | None = None, zoom_ratio: float = .5) -> None:
         self.device = device
         self.verifier = verifier
         self.policy = policy or DevicePolicy()
         self.max_steps = max_steps
         self.trace = trace
+        if not 0 < zoom_ratio <= 1:
+            raise ValueError("zoom_ratio must be in (0, 1]")
+        self.zoom_ratio = zoom_ratio
 
     def _record(self, events: list[Event], event: Event) -> None:
         events.append(event)
@@ -78,6 +81,16 @@ class Harness:
             if not policy.allowed:
                 self._record(events, Event(step, decision, ActionResult(False, "blocked by policy"), policy.reason))
                 observation = self.device.observe()
+                continue
+            if action.kind is ActionKind.ZOOM:
+                try:
+                    if action.x is None or action.y is None:
+                        raise ValueError("zoom requires x/y")
+                    ratio = action.ratio or self.zoom_ratio
+                    observation = observation.zoomed(action.x, action.y, ratio)
+                    self._record(events, Event(step, decision, ActionResult(True, f"zoomed to {observation.width}x{observation.height}")))
+                except ValueError as exc:
+                    self._record(events, Event(step, decision, ActionResult(False, str(exc))))
                 continue
             result = self.device.act(action, observation)
             self._record(events, Event(step, replace(decision, action=action), result, policy.reason))

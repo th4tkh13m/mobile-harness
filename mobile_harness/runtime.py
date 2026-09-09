@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import inspect
 import errno
 import os
 import time
@@ -43,6 +44,7 @@ class PlanStep:
     budget: int | None = None
     depends_on: tuple[str, ...] = ()
     retry_not_before: str = ""
+    parent: str = ""
 
 
 @dataclass
@@ -59,6 +61,7 @@ class SessionState:
     task: str
     workspace_root: str
     plan: list[PlanStep] = field(default_factory=list)
+    plan_revision: int = 0
     events: list[RuntimeEvent] = field(default_factory=list)
     summary: str = ""
     status: str = "running"  # running | awaiting_approval | verified | failed | blocked
@@ -68,6 +71,12 @@ class SessionState:
     observation: dict[str, Any] = field(default_factory=dict)
     observation_fingerprint: str = ""
     stagnant_turns: int = 0
+    zoom_view: dict[str, int] | None = None
+    action_outcome: dict[str, Any] | None = None
+    # A model-authored plan/todo write is required before another dependent
+    # mutation or completion claim.  This is deliberately durable: a resumed
+    # session must not silently skip a progress acknowledgement.
+    plan_update_required: dict[str, Any] | None = None
 
 
 class RuntimeModel(Protocol):
@@ -158,7 +167,7 @@ class LegacyVerifierAdapter:
 
 class SessionStore:
     """Snapshot plus append-only journal: interrupted writes never erase history."""
-    snapshot_version = 2
+    snapshot_version = 4
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -279,8 +288,14 @@ class SessionStore:
             raise RuntimeError(f"invalid session snapshot schema: {version}")
         if version <= 1:
             data.setdefault("claimed_evidence", [])
+            data.setdefault("zoom_view", None)
             for step in data.get("plan", []):
                 step.setdefault("depends_on", ())
+        if version <= 2:
+            data.setdefault("action_outcome", None)
+            data.setdefault("plan_revision", 0)
+        if version <= 3:
+            data.setdefault("plan_update_required", None)
         required = {"id", "task", "workspace_root"}
         if not required.issubset(data):
             raise RuntimeError("session snapshot is missing required state fields")
@@ -365,13 +380,18 @@ class MobileAgentRuntime:
 
     def __init__(self, model: RuntimeModel, broker: ToolBroker, verifier: RuntimeVerifier, store: SessionStore,
                  prompts: PromptAssembler | None = None, max_turns: int = 40, recovery: RecoveryPolicy | None = None,
-                 parallel_tool_timeout_seconds: float = 20.0) -> None:
+                 parallel_tool_timeout_seconds: float = 20.0, capture_after_actions: bool = True,
+                 require_plan_before_mutation: bool = False,
+                 require_plan_update_on_transition: bool = False) -> None:
         self.model, self.broker, self.verifier, self.store = model, broker, verifier, store
         self.prompts, self.max_turns = prompts or PromptAssembler(), max_turns
         self.recovery = recovery or RecoveryPolicy()
         if not 0.1 <= parallel_tool_timeout_seconds <= 120:
             raise ValueError("parallel tool timeout must be between 0.1 and 120 seconds")
         self.parallel_tool_timeout_seconds = parallel_tool_timeout_seconds
+        self.capture_after_actions = bool(capture_after_actions)
+        self.require_plan_before_mutation = bool(require_plan_before_mutation)
+        self.require_plan_update_on_transition = bool(require_plan_update_on_transition)
         if self.broker.session_search is None:
             self.broker.session_search = lambda query, limit: self.store.search(query, limit=limit)
         if self.broker.session_history is None:
@@ -414,7 +434,8 @@ class MobileAgentRuntime:
         for _ in range(self.max_turns):
             if state.status != "running":
                 break
-            observation = self.broker.device.observe()
+            observation = self._observe_for_turn(state)
+            self.broker.set_current_observation(observation)
             state.observation = self.broker.observation_payload(observation)
             state.observation["evidence"] = self.store.capture_observation(state.id, observation)
             fingerprint = hashlib.sha256(json.dumps(state.observation, sort_keys=True).encode("utf-8")).hexdigest()
@@ -426,8 +447,17 @@ class MobileAgentRuntime:
                 self._recover(state, "stale observation: three consecutive identical UI states")
                 state.stagnant_turns = 0
             system, context = self.prompts.render(state, self.broker)
+            if image := self.broker.current_screen_image():
+                context = dict(context)
+                context["current_screen_image"] = image
+            def model_event(kind: str, payload: dict[str, Any]) -> None:
+                self._event(state, f"model_{kind}", payload)
             try:
-                text, calls = self.model.respond(system=system, context=context, tools=self.broker.schemas())
+                respond_parameters = inspect.signature(self.model.respond).parameters
+                if "on_event" in respond_parameters or any(param.kind is inspect.Parameter.VAR_KEYWORD for param in respond_parameters.values()):
+                    text, calls = self.model.respond(system=system, context=context, tools=self.broker.schemas(), on_event=model_event)
+                else:
+                    text, calls = self.model.respond(system=system, context=context, tools=self.broker.schemas())
             except Exception as exc:
                 self._event(state, "model_failure", {"error": str(exc), "attempts": self._model_attempts()})
                 self._recover(state, f"model provider failure: {exc}")
@@ -443,12 +473,33 @@ class MobileAgentRuntime:
             results = self._execute_calls(calls, state, observation)
             for call, result in results:
                 self._event(state, "tool_result", {"call": asdict(call), "result": result.to_dict()})
+                if self._is_plan_write(call) and result.ok:
+                    obligation = state.plan_update_required
+                    state.plan_update_required = None
+                    self._event(state, "plan_updated", {"revision": state.plan_revision, "steps": [asdict(step) for step in state.plan], "satisfied_requirement": obligation})
                 if result.approval_required:
                     state.status, state.pending_approval = "awaiting_approval", {"approval": result.approval, "call": asdict(call)}
                     break
                 if not result.ok:
+                    if self._is_plan_update_gate_error(result):
+                        # This is deliberate control flow, not a device failure.
+                        # Preserve the outstanding model-authored acknowledgement
+                        # rather than creating a misleading recovery transition.
+                        self._event(state, "plan_update_enforced", {"call": asdict(call), "requirement": state.plan_update_required})
+                        break
                     self._recover(state, result.error or f"{call.name} failed")
                     break
+                if call.name in {"tap", "swipe", "drag", "type_text", "key", "launch_app", "wait"}:
+                    self._record_mobile_outcome(state, call, observation, result)
+                if call.name == "zoom":
+                    viewport = result.content.get("viewport") if isinstance(result.content, dict) else None
+                    if not isinstance(viewport, dict):
+                        self._recover(state, "zoom did not return a viewport")
+                        break
+                    state.zoom_view = {key: int(viewport[key]) for key in ("left", "top", "width", "height")}
+                    continue
+                if call.name in {"tap", "swipe", "drag", "type_text", "key", "launch_app", "wait"}:
+                    state.zoom_view = None
                 if call.name == "claim_done" and result.ok:
                     verdict = self._verify(state, observation)
                     verification = verdict.to_dict()
@@ -463,7 +514,7 @@ class MobileAgentRuntime:
                     else:
                         self._recover(state, verdict.summary)
                     break
-            if self.prompts.compact_if_needed(state):
+            if self.prompts.compact_if_needed(state, limit=None, context_budget=self.prompts.max_context_tokens):
                 self.prompts.invalidate_session(state)
             self.store.save(state)
         if state.status == "running":
@@ -472,8 +523,109 @@ class MobileAgentRuntime:
         self.store.save(state)
         return state
 
+    @staticmethod
+    def _observation_fingerprint(observation: Observation) -> tuple[str | None, str]:
+        """Return independent visual and semantic state signals.
+
+        Chrome can update its accessibility/UI hierarchy (for example, focus or
+        a web filter panel) before its rendered pixels differ.  A screenshot
+        hash alone would falsely call that a no-op.  Conversely, a visual-only
+        transition may not be exposed in the hierarchy.  Either signal is
+        therefore sufficient to establish that the state changed.
+        """
+        visual = hashlib.sha256(observation.screenshot_png).hexdigest() if observation.screenshot_png else None
+        if observation.ui_xml:
+            semantic_source = observation.ui_xml.encode("utf-8")
+        else:
+            visible = [(item.bounds.left, item.bounds.top, item.bounds.right, item.bounds.bottom,
+                        item.text, item.content_desc, item.resource_id, item.clickable)
+                       for item in observation.elements]
+            semantic_source = json.dumps({"activity": observation.activity, "elements": visible}, ensure_ascii=False).encode("utf-8")
+        return visual, hashlib.sha256(semantic_source).hexdigest()
+
+    def _record_mobile_outcome(self, state: SessionState, call: ToolCall, before: Observation, result: ToolResult) -> None:
+        """Hermes-style result contract for Android where ADB has no semantic read-back.
+
+        ADB dispatch success is deliberately not treated as UI success.  We capture
+        a post-action observation immediately, preserve both evidence references,
+        and classify only what the runtime can honestly establish.  The model gets
+        this structured verdict on its next decision turn.
+        """
+        before_evidence = state.observation.get("evidence", {}) if isinstance(state.observation, dict) else {}
+        if not self.capture_after_actions:
+            outcome = {
+                "action": call.name, "arguments": dict(call.arguments), "dispatched": True,
+                "verified": False, "effect": "unverifiable",
+                "verdict": {"decision": "verify_fresh_state", "recommended": "observe", "reason": "post-action capture is disabled by runtime configuration"},
+                "before_evidence": before_evidence,
+            }
+            state.action_outcome = outcome
+            self._event(state, "action_outcome", outcome)
+            if self.require_plan_update_on_transition and state.plan:
+                self._require_plan_update(state, "post_action_assessment", {
+                    "action": call.name, "effect": outcome["effect"], "active_step_id": self._active_step_id(state),
+                    "reason": "Assess the fresh outcome and record progress, failure, or recovery before the next dependent action.",
+                })
+            return
+        try:
+            after = self.broker.device.observe()
+            after_evidence = self.store.capture_observation(state.id, after)
+            changed = self._observation_fingerprint(before) != self._observation_fingerprint(after)
+            if changed:
+                effect, decision, reason = "unverifiable", "verify_fresh_state", "screen changed after dispatch; semantic task effect is not yet proven"
+                recommended = "inspect_current_state"
+            else:
+                effect, decision, reason = "suspected_noop", "escalate", "post-action screen is unchanged"
+                recommended = "zoom" if call.name in {"tap", "swipe", "drag"} and not call.arguments.get("locator") else "reobserve_or_use_locator"
+            outcome = {
+                "action": call.name, "arguments": dict(call.arguments), "dispatched": True,
+                "verified": False, "effect": effect,
+                "verdict": {"decision": decision, "recommended": recommended, "reason": reason},
+                "before_evidence": before_evidence, "after_evidence": after_evidence,
+            }
+        except Exception as exc:
+            outcome = {
+                "action": call.name, "arguments": dict(call.arguments), "dispatched": True,
+                "verified": False, "effect": "unverifiable",
+                "verdict": {"decision": "verify_fresh_state", "recommended": "observe", "reason": f"post-action capture failed: {exc}"},
+                "before_evidence": before_evidence,
+            }
+        state.action_outcome = outcome
+        self._event(state, "action_outcome", outcome)
+        if self.require_plan_update_on_transition and state.plan:
+            self._require_plan_update(state, "post_action_assessment", {
+                "action": call.name,
+                "effect": outcome["effect"],
+                "active_step_id": self._active_step_id(state),
+                "reason": "Assess the fresh outcome and record progress, failure, or recovery before the next dependent action.",
+            })
+
+    def _observe_for_turn(self, state: SessionState) -> Observation:
+        observation = self.broker.device.observe()
+        if not state.zoom_view:
+            return observation
+        try:
+            view = state.zoom_view
+            return observation.cropped(view["left"], view["top"], view["width"], view["height"])
+        except (KeyError, ValueError) as exc:
+            state.zoom_view = None
+            self._event(state, "zoom_view_cleared", {"reason": str(exc)})
+            return observation
+
     def _execute_calls(self, calls: list[ToolCall], state: SessionState, observation: Observation) -> list[tuple[ToolCall, ToolResult]]:
         """Parallelize only independent read-only operations; preserve action order."""
+        if any(call.name == "zoom" for call in calls) and len(calls) != 1:
+            return [(call, ToolResult(False, error="zoom must be the only tool call in its turn; act on the crop in the next turn")) for call in calls]
+        mobile_mutations = {"tap", "swipe", "drag", "type_text", "key", "zoom", "launch_app", "wait"}
+        plan_write = any(self._is_plan_write(call) for call in calls)
+        dependent = mobile_mutations | {"claim_done"}
+        if self.require_plan_before_mutation and plan_write and any(call.name in mobile_mutations for call in calls):
+            return [(call, ToolResult(False, error="commit the durable plan update in its own turn; inspect the logged plan before a dependent Android action or completion claim")) for call in calls]
+        if self.require_plan_update_on_transition and plan_write and any(call.name == "claim_done" for call in calls):
+            return [(call, ToolResult(False, error="commit the durable plan update in its own turn; inspect the logged plan before a dependent Android action or completion claim")) for call in calls]
+        if self.require_plan_update_on_transition and state.plan_update_required and any(call.name in dependent for call in calls):
+            reason = str(state.plan_update_required.get("reason", "a plan progress update is required"))
+            return [(call, ToolResult(False, error=f"write a durable plan or todo update before this dependent action: {reason}")) for call in calls]
         readonly = {"observe", "web_search", "web_read", "search_files", "read_file", "memory_search", "skill_search", "skills_list", "skill_view", "session_search", "session_trace"}
         parallel = [call for call in calls if call.name in readonly]
         serial = [call for call in calls if call.name not in readonly]
@@ -494,7 +646,11 @@ class MobileAgentRuntime:
             # Do not wait for an injected read-only provider that ignores its own
             # cancellation contract. Built-in network tools retain I/O timeouts.
             pool.shutdown(wait=False, cancel_futures=True)
-        output.extend((call, self.broker.execute(call, state, observation)) for call in serial)
+        for call in serial:
+            if self.require_plan_before_mutation and call.name in mobile_mutations and not state.plan:
+                output.append((call, ToolResult(False, error="create a durable plan before the first Android mutation; use plan(action='set', steps=[...])")))
+            else:
+                output.append((call, self.broker.execute(call, state, observation)))
         return output
 
     def _verify(self, state: SessionState, observation: Observation) -> VerificationEvidence:
@@ -525,6 +681,31 @@ class MobileAgentRuntime:
             next_step = next((step for step in state.plan if step.id == directive.next_step_id), None)
             if next_step and next_step is not active and next_step.status in {"pending", "blocked"}:
                 next_step.status = "in_progress"
+        if self.require_plan_update_on_transition and state.plan:
+            self._require_plan_update(state, "recovery", {
+                "classification": directive.classification,
+                "active_step_id": self._active_step_id(state),
+                "reason": "Record the failure or recovery decision in the durable plan before continuing.",
+            })
+
+    @staticmethod
+    def _is_plan_write(call: ToolCall) -> bool:
+        return call.name == "plan" or (call.name == "todo" and "todos" in call.arguments)
+
+    @staticmethod
+    def _is_plan_update_gate_error(result: ToolResult) -> bool:
+        return result.error.startswith("write a durable plan or todo update before this dependent action:")
+
+    @staticmethod
+    def _active_step_id(state: SessionState) -> str | None:
+        active = next((step.id for step in state.plan if step.status == "in_progress"), None)
+        return active
+
+    def _require_plan_update(self, state: SessionState, trigger: str, details: dict[str, Any]) -> None:
+        """Persist a model-owned plan acknowledgement without inventing its contents."""
+        requirement = {"trigger": trigger, **details, "required_after_revision": state.plan_revision}
+        state.plan_update_required = requirement
+        self._event(state, "plan_update_required", requirement)
 
     def _event(self, state: SessionState, kind: str, payload: dict[str, Any]) -> None:
         event = RuntimeEvent(max((item.sequence for item in state.events), default=0) + 1, kind, payload)

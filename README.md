@@ -40,6 +40,18 @@ runtime = MobileAgentRuntime(model, broker, verifier, SessionStore("sessions"))
 state = runtime.run(runtime.start("Complete the Android task", "."))
 ```
 
+## Durable runtime command
+
+`python -m mobile_harness` runs `MobileAgentRuntime`, not the legacy compatibility loop. Configure the non-secret model/device/runtime settings in [`mobile_harness/config.json`](mobile_harness/config.json), export `OPENAI_API_KEY`, then run:
+
+```powershell
+python -m mobile_harness "Open Settings and show Wi-Fi" --config path/to/harness-config.json
+```
+
+It writes durable sessions beneath `runtime.session_root`. Resume one with `--resume <session-id>`; resolve a paused consequential action explicitly with `--resume <session-id> --approve` or `--deny`. The former loop remains available only as `mobile-harness-legacy` for compatibility.
+
+`authority.auto_approve_mobile_actions` controls whether the runtime pauses for approval before consequential mobile UI actions. It is enabled in the current config. It does not authorize workspace writes, commands, or external integrations.
+
 ### Isolated non-GUI delegation
 
 Delegation is intentionally restricted to research and read-only workspace
@@ -114,13 +126,34 @@ python -m pip install -e .
 No model SDK is bundled. Connect an LLM by implementing `Agent.decide`; this
 keeps credentials and prompt formatting outside the device runtime.
 
-## Real ADB device run
+## Legacy compatibility loop
 
-With Android Platform Tools available on `PATH`, run:
+Live-run defaults are centralized in [`mobile_harness/config.json`](mobile_harness/config.json): model name/base URL, ADB serial and timeout, trace path, step limit, and mobile policy settings. Keep API keys out of this file; provide `OPENAI_API_KEY` through the environment. Copy it to a run-specific JSON file, set the non-secret values, and pass it with `--config`. Command-line flags override the corresponding config value for one run.
+
+The agent-facing coordinate space is a fixed logical 0..1000 by 0..1000 canvas: all `tap`, `swipe`, `drag`, and `zoom` coordinates are integers in that space, regardless of device resolution or crop size. The runtime converts them to its normalized internal representation before ADB dispatch. Following Hermes Computer Use, `tap(element=N)` using the current observation's 1-based element index is preferred to raw coordinates; coordinates are only fallback. For dense, ambiguous, or previously missed coordinate targets, `zoom` crops an aspect-preserving view without sending a device gesture; the next action is grounded in that crop and maps back to the physical screen. `harness.zoom_ratio` controls the default crop size (0.5 means half the screen width and height); an action may supply its own ratio in `(0, 1]`.
+
+The durable runtime follows the Hermes Computer Use evidence rule: ADB acceptance is only dispatch success, never proof that the UI changed as intended. With `runtime.capture_after_actions: true`, it immediately captures the post-action Android state, stores before/after evidence, and gives the next model turn a structured `action_outcome`: `unverifiable` requires inspecting the new state, while `suspected_noop` supplies a recovery recommendation such as `zoom` for a missed coordinate gesture.
+
+`runtime.require_plan_before_actions` is enabled by default. It requires an independent `plan` or `todo` turn before Android mutation, assigns each plan update a durable revision, and appends `plan_updated` records to the session journal. This follows Hermes’s task-list model: small ordered steps, one active step, and completion only when its evidence is recorded.
+
+`runtime.context_window_tokens` is set to `200000`, matching the available model context. The runtime does not compact merely because a session has accumulated a fixed number of events; it preserves the complete plan/outcome journal until it approaches this provider context window. `runtime.memory_root` and `runtime.skills_root` select the persistent cross-session fact and procedure stores used by the production entrypoint.
+
+The Chat Completions runtime uses Hermes-style SSE streaming by default. Its
+`model_request_started`, `model_first_delta`, `model_request_completed`, and
+`model_stalled` journal events distinguish slow prefill/decoding from a server
+that has stopped producing output. `runtime.model_stale_timeout_seconds` is the
+idle-event watchdog (150 seconds by default), not a model token limit; active
+stream events keep a long decode alive. Set `runtime.model_streaming` to false
+only for an endpoint that does not support OpenAI-compatible SSE.
+`runtime.model_stream_progress_interval_seconds` adds periodic non-content
+diagnostics—SSE event count, event kinds, and generated content/reasoning/tool
+argument character totals—without persisting raw hidden reasoning.
+
+The former lightweight ADB loop does not use `MobileAgentRuntime` or [`prompts.py`](mobile_harness/prompts.py). It remains only for compatibility with callers that implement `OpenAICompatibleAgent` behavior directly. With Android Platform Tools available on `PATH`, run:
 
 ```powershell
 $env:OPENAI_API_KEY = "..."
-python -m mobile_harness "Open Settings and show Wi-Fi" --model <model> --base-url <endpoint> --serial <adb-serial>
+mobile-harness-legacy "Open Settings and show Wi-Fi" --config path/to/harness-config.json
 ```
 
 The agent has only the typed mobile tools. When it calls `claim_done`, the

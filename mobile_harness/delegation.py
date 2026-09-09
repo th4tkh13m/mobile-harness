@@ -187,7 +187,7 @@ class DelegationManager:
 
     @staticmethod
     def _validate(tasks: list[DelegatedTask]) -> None:
-        forbidden = {"tap", "swipe", "drag", "type_text", "key", "back", "home", "launch_app", "write_file", "patch", "run_command", "delegate_non_gui"}
+        forbidden = {"tap", "swipe", "drag", "type_text", "key", "launch_app", "write_file", "patch", "run_command", "delegate_non_gui"}
         for task in tasks:
             if forbidden & set(task.tool_allowlist):
                 raise ValueError("delegated tasks may not receive GUI, write, command, or recursive delegation tools")

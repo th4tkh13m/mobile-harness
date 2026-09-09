@@ -40,9 +40,9 @@ def decision_from_mai_action(payload: dict[str, Any]) -> Decision:
     if action == "system_button":
         button = _require_string(payload, "button").lower()
         if button == "back":
-            return Decision(action=Action(ActionKind.BACK))
+            return Decision(action=Action(ActionKind.KEY, key="BACK"))
         if button == "home":
-            return Decision(action=Action(ActionKind.HOME))
+            return Decision(action=Action(ActionKind.KEY, key="HOME"))
         if button == "enter":
             return Decision(action=Action(ActionKind.KEY, key="ENTER"))
         raise ValueError(f"unsupported MAI-UI system button: {button}")

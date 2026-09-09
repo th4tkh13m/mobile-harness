@@ -3,6 +3,10 @@ from __future__ import annotations
 import unittest
 from unittest.mock import mock_open, patch
 import os
+import json
+import io
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from mobile_harness.core import Harness
 from mobile_harness.model import Action, ActionKind, ActionResult, Decision, Observation, Rect, UIElement
@@ -53,12 +57,38 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual([action.kind for action in device.actions], [ActionKind.TAP])
 
     def test_sensitive_screen_blocks_interaction_without_explicit_approval(self):
+        from mobile_harness.config import PolicySettings
         device = FakeDevice(sensitive=True)
         agent = SequenceAgent([Decision(action=Action(ActionKind.TAP, x=.2, y=.2))])
-        result = Harness(device, Verifier([]), policy=DevicePolicy(), max_steps=1).run("task", agent)
+        result = Harness(device, Verifier([]), policy=DevicePolicy(settings=PolicySettings(("permission",), ("tap",))), max_steps=1).run("task", agent)
         self.assertFalse(result.success)
         self.assertEqual(device.actions, [])
         self.assertIn("sensitive UI", result.events[0].policy_message)
+
+    def test_policy_settings_are_loaded_from_central_json_config(self):
+        from mobile_harness.config import load_harness_config
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "policy.json"
+            config.write_text(json.dumps({
+                "model": {"name": None, "base_url": None},
+                "device": {"serial": None, "adb_timeout_seconds": 10},
+                "harness": {"max_steps": 5, "trace_path": "trace.jsonl", "zoom_ratio": .5},
+                "runtime": {"provider": "chat_completions", "max_turns": 5, "session_root": "sessions", "workspace_root": ".", "capture_after_actions": True, "require_plan_before_actions": True, "require_plan_update_on_transition": True, "context_window_tokens": 200000, "memory_root": "memory", "skills_root": "skills", "compaction_summary_timeout_seconds": 20, "model_stale_timeout_seconds": 150, "model_streaming": True, "model_stream_progress_interval_seconds": 15},
+                "authority": {"auto_approve_mobile_actions": True},
+                "policy": {"sensitive_terms": ["password"], "guarded_action_kinds": ["type_text"]},
+            }))
+            settings = load_harness_config(config)
+            self.assertEqual(settings.harness.max_steps, 5)
+            self.assertEqual(settings.device.adb_timeout_seconds, 10)
+            self.assertTrue(settings.runtime.capture_after_actions)
+            self.assertTrue(settings.runtime.require_plan_before_actions)
+            self.assertTrue(settings.runtime.require_plan_update_on_transition)
+            self.assertEqual(settings.runtime.context_window_tokens, 200000)
+            self.assertTrue(settings.authority.auto_approve_mobile_actions)
+            decision = DevicePolicy(settings=settings.policy).check(
+                Action(ActionKind.TAP, x=.2, y=.2), FakeDevice(sensitive=True).observe()
+            )
+        self.assertTrue(decision.allowed)
 
     def test_locator_is_preferred_over_coordinates(self):
         from mobile_harness.ports import resolve_tap
@@ -81,6 +111,67 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(argv, ("shell", "input", "tap", "50", "50"))
         with self.assertRaises(ValueError):
             AdbDevice()._action_argv(Action(ActionKind.TYPE_TEXT, text="xin chào"), observation)
+
+    def test_key_is_the_only_back_and_home_transport(self):
+        from mobile_harness.contracts import openai_tools
+        from mobile_harness.ports import AdbDevice
+        names = {tool["function"]["name"] for tool in openai_tools()}
+        self.assertNotIn("back", names)
+        self.assertNotIn("home", names)
+        observation = Observation(100, 200)
+        self.assertEqual(AdbDevice()._action_argv(Action(ActionKind.KEY, key="BACK"), observation), ("shell", "input", "keyevent", "BACK"))
+        self.assertEqual(AdbDevice()._action_argv(Action(ActionKind.KEY, key="HOME"), observation), ("shell", "input", "keyevent", "HOME"))
+
+    def test_key_schema_and_transports_share_the_explicit_key_vocabulary(self):
+        from mobile_harness.contracts import decision_from_tool_call, openai_tools
+        from mobile_harness.ports import AdbDevice
+        key_schema = next(tool["function"] for tool in openai_tools() if tool["function"]["name"] == "key")
+        self.assertIn("BACK", key_schema["parameters"]["properties"]["key"]["enum"])
+        self.assertIn("VOLUME_MUTE", key_schema["parameters"]["properties"]["key"]["enum"])
+        with self.assertRaisesRegex(ValueError, "unsupported key"):
+            decision_from_tool_call("key", {"key": "KEYCODE_ENTER"})
+        with self.assertRaisesRegex(ValueError, "unsupported key"):
+            AdbDevice()._action_argv(Action(ActionKind.KEY, key="POWER"), Observation(100, 200))
+
+    def test_model_action_contract_uses_integer_1000_space_but_internal_actions_remain_normalized(self):
+        from mobile_harness.contracts import decision_from_tool_call, openai_tools
+        tap_schema = next(tool["function"] for tool in openai_tools() if tool["function"]["name"] == "tap")
+        self.assertEqual(tap_schema["parameters"]["properties"]["x"]["type"], "integer")
+        self.assertEqual(tap_schema["parameters"]["properties"]["x"]["maximum"], 1000)
+        decision = decision_from_tool_call("tap", {"x": 500, "y": 250})
+        self.assertEqual((decision.action.x, decision.action.y), (.5, .25))
+        with self.assertRaisesRegex(ValueError, "integer"):
+            decision_from_tool_call("tap", {"x": .5, "y": .25})
+
+    def test_zoom_crops_observation_and_maps_following_tap_to_physical_screen(self):
+        from PIL import Image
+        from mobile_harness.ports import AdbDevice
+        image = Image.new("RGB", (100, 200), "white")
+        encoded = io.BytesIO(); image.save(encoded, format="PNG")
+        observation = Observation(100, 200, screenshot_png=encoded.getvalue(), elements=(UIElement(Rect(45, 95, 55, 105), text="Target", clickable=True),))
+        zoom = observation.zoomed(.5, .5, .5)
+        self.assertEqual((zoom.width, zoom.height, zoom.viewport_left, zoom.viewport_top), (50, 100, 25, 50))
+        self.assertEqual(zoom.elements[0].bounds, Rect(20, 45, 30, 55))
+        self.assertEqual(
+            AdbDevice()._action_argv(Action(ActionKind.TAP, x=.5, y=.5), zoom),
+            ("shell", "input", "tap", "50", "100"),
+        )
+
+    def test_zoom_is_a_view_only_action_before_the_following_device_action(self):
+        from PIL import Image
+        image = Image.new("RGB", (100, 200), "white")
+        encoded = io.BytesIO(); image.save(encoded, format="PNG")
+        device = FakeDevice()
+        device.observation = Observation(100, 200, screenshot_png=encoded.getvalue())
+        agent = SequenceAgent([
+            Decision(action=Action(ActionKind.ZOOM, x=.5, y=.5)),
+            Decision(action=Action(ActionKind.TAP, x=.5, y=.5)),
+            Decision(done=True),
+        ])
+        result = Harness(device, Verifier([True]), max_steps=3).run("zoom then tap", agent)
+        self.assertTrue(result.success)
+        self.assertEqual([event.result.message for event in result.events[:2]], ["zoomed to 50x100", ""])
+        self.assertEqual([action.kind for action in device.actions], [ActionKind.TAP])
 
     def test_adb_path_discovery_supports_android_sdk_root(self):
         from mobile_harness.ports import resolve_adb_path

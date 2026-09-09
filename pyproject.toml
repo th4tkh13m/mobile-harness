@@ -7,9 +7,14 @@ name = "mobile-harness"
 version = "0.1.0"
 description = "Constrained Android agent harness with ADB and benchmark ports"
 requires-python = ">=3.10"
+dependencies = ["Pillow>=10"]
 
 [project.scripts]
-mobile-harness = "mobile_harness.cli:main"
+mobile-harness = "mobile_harness.runtime_cli:main"
+mobile-harness-legacy = "mobile_harness.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["mobile_harness*"]
+
+[tool.setuptools.package-data]
+mobile_harness = ["config.json"]
