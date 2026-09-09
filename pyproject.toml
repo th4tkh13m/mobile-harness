@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mobile-harness"
+version = "0.1.0"
+description = "Constrained Android agent harness with ADB and benchmark ports"
+requires-python = ">=3.10"
+
+[project.scripts]
+mobile-harness = "mobile_harness.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mobile_harness*"]
