@@ -15,9 +15,9 @@ def token_counter_from_encoding(encode: Callable[[str], Any]) -> Callable[[str],
     return lambda text: len(encode(text))
 
 
-def _post(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
+def _post(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float = 90.0) -> dict[str, Any]:
     req = request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
-    with request.urlopen(req, timeout=90) as response:
+    with request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -160,7 +160,16 @@ class OpenAIChatRuntimeModel:
                                 progress_interval_seconds=self.stream_progress_interval_seconds, on_event=on_event)
         started = time.monotonic()
         _emit(on_event, "request_started", streaming=False)
-        message = self.post(self.base_url.rstrip("/") + "/chat/completions", {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}, payload)["choices"][0]["message"]
+        url = self.base_url.rstrip("/") + "/chat/completions"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        # The real transport accepts the evaluator's configured total request
+        # timeout. Preserve the three-argument custom-post seam used by tests
+        # and integrations.
+        response = (
+            _post(url, headers, payload, timeout=self.stale_timeout_seconds)
+            if self.post is _post else self.post(url, headers, payload)
+        )
+        message = response["choices"][0]["message"]
         text, calls = message.get("content") or "", _calls(message.get("tool_calls") or [])
         _emit(on_event, "request_completed", elapsed_seconds=round(time.monotonic() - started, 3), text_characters=len(text), tool_count=len(calls), streaming=False)
         return text, calls

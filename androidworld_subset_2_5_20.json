@@ -1,0 +1,53 @@
+{
+  "name": "mobile_harness_androidworld_2_5_20_v1",
+  "description": "Fixed AndroidWorld subset for harness evolution. The 2-task screen is nested in the 5-task selection set, which is nested in the 20-task evaluation set.",
+  "version": 1,
+  "screen": [
+    "ClockStopWatchRunning",
+    "ContactsAddContact"
+  ],
+  "selection": [
+    "ClockStopWatchRunning",
+    "ContactsAddContact",
+    "SimpleCalendarAddOneEventTomorrow",
+    "SystemWifiTurnOffVerify",
+    "MarkorCreateNote"
+  ],
+  "evaluation": [
+    "ClockStopWatchRunning",
+    "ClockTimerEntry",
+    "ContactsAddContact",
+    "ContactsNewContactDraft",
+    "SimpleCalendarAddOneEventTomorrow",
+    "SimpleCalendarAddRepeatingEvent",
+    "SystemWifiTurnOffVerify",
+    "SystemBluetoothTurnOnVerify",
+    "MarkorCreateNote",
+    "MarkorEditNote",
+    "MarkorCreateFolder",
+    "SimpleSmsSend",
+    "SimpleSmsReply",
+    "FilesMoveFile",
+    "FilesDeleteFile",
+    "CameraTakePhoto",
+    "BrowserDraw",
+    "BrowserMaze",
+    "ExpenseAddSingle",
+    "SimpleDrawProCreateDrawing"
+  ],
+  "selection_policy": {
+    "screen_size": 2,
+    "selection_size": 5,
+    "evaluation_size": 20,
+    "nested": true,
+    "seed": 42,
+    "screen_gate": 0.5,
+    "selection_gate": 0.4
+  },
+  "coverage": {
+    "apps": ["Clock", "Contacts", "Simple Calendar", "System", "Markor", "Simple SMS Messenger", "Files", "Camera", "Chrome", "Arduia Pro Expense", "Simple Draw Pro"],
+    "capabilities": ["launch", "tap", "text_entry", "keyboard", "verification", "data_edit", "search", "screen_reading", "multi_app", "drawing", "browser_game"],
+    "difficulty": {"easy": 16, "medium": 4, "hard": 0}
+  },
+  "rationale": "The screen is deliberately small and representative: one stable control task and one data-entry task. Selection adds calendar, system verification, and note creation. Evaluation expands across distinct apps and control patterns without allowing one app family to dominate the score. Hard multi-app tasks are deferred until their setup snapshots and transport are verified."
+}

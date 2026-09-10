@@ -204,3 +204,6 @@ agent, not the default policy for production use.
 MobileWorld-compatible `src/mobile_world` runtime surface: screenshots,
 `JSONAction` execution, and task scoring. Pair them with
 `VerifiedExperienceStore` when evaluating persistence across tasks/sessions.
+
+For the harness-owned model evaluation launcher, its dependency boundary, and
+staged run commands, see [ANDROIDWORLD_EVALUATION.md](ANDROIDWORLD_EVALUATION.md).

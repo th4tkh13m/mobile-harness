@@ -14,12 +14,14 @@ class AndroidWorldAdapter(CallbackAdapter):
     def __init__(
         self,
         env: Any,
-        execute_json_action: Callable[[Any, list[Any], tuple[int, int], Any], None],
-        action_factory: Callable[[Action, int, int], Any],
+        execute_json_action: Callable[[Any, list[Any], tuple[int, int], Any], None] | None = None,
+        action_factory: Callable[[Action, int, int], Any] | None = None,
+        action_executor: Callable[[Action, Observation, Any], None] | None = None,
     ) -> None:
         self.env = env
         self._execute_json_action = execute_json_action
         self._action_factory = action_factory
+        self._action_executor = action_executor
         super().__init__(self._observe, self._act)
 
     def _observe(self) -> Observation:
@@ -38,13 +40,18 @@ class AndroidWorldAdapter(CallbackAdapter):
 
     def _act(self, action: Action, observation: Observation) -> ActionResult:
         try:
-            state = self.env.get_state(wait_to_stabilize=False)
-            self._execute_json_action(
-                self._action_factory(action, observation.width, observation.height),
-                state.ui_elements,
-                (observation.width, observation.height),
-                self.env.controller,
-            )
+            if self._action_executor is not None:
+                self._action_executor(action, observation, self.env.controller)
+            else:
+                if self._execute_json_action is None or self._action_factory is None:
+                    raise RuntimeError("AndroidWorldAdapter has no action dispatch boundary")
+                state = self.env.get_state(wait_to_stabilize=False)
+                self._execute_json_action(
+                    self._action_factory(action, observation.width, observation.height),
+                    state.ui_elements,
+                    (observation.width, observation.height),
+                    self.env.controller,
+                )
             return ActionResult(True)
         except Exception as exc:
             return ActionResult(False, str(exc))
@@ -70,7 +77,15 @@ def androidworld_action_factory(action: Action, width: int, height: int) -> Any:
     This intentionally covers the action types implemented by AndroidWorld's
     `execute_adb_action`, not the benchmark-only answer/terminate pseudo-tools.
     """
-    from android_world.agents.new_json_action import JSONAction
+    try:
+        # AndroidWorld v3.5 exposed this class from ``agents``; current
+        # releases keep it under the environment package.  Import whichever
+        # official API is installed without depending on a Mobile-Agent tree.
+        from android_world.agents.new_json_action import JSONAction
+        legacy_action_api = True
+    except ModuleNotFoundError:
+        from android_world.env.json_action import JSONAction
+        legacy_action_api = False
     from .ports import pixel
 
     if action.kind is ActionKind.TAP:
@@ -90,10 +105,65 @@ def androidworld_action_factory(action: Action, width: int, height: int) -> Any:
     if action.kind is ActionKind.SWIPE:
         if None in (action.x, action.y, action.x2, action.y2):
             raise ValueError("AndroidWorld swipe requires four normalized coordinates")
-        converted = JSONAction(action_type="swipe")
-        converted.direction = (pixel(action.x, width), pixel(action.y, height), pixel(action.x2, width), pixel(action.y2, height))
-        return converted
+        if legacy_action_api:
+            converted = JSONAction(action_type="swipe")
+            converted.direction = (pixel(action.x, width), pixel(action.y, height), pixel(action.x2, width), pixel(action.y2, height))
+            return converted
+        return JSONAction(action_type="swipe", direction=_swipe_direction(action))
     raise ValueError(f"AndroidWorld cannot map action {action.kind}")
+
+
+def execute_androidworld_action(action: Action, observation: Observation, controller: Any) -> None:
+    """Dispatch the harness Action directly through AndroidWorld's controller.
+
+    This is the production path. It deliberately avoids AndroidWorld's
+    version-specific JSONAction class; the benchmark controller is only used
+    as the device transport at this integration edge.
+    """
+    import time
+    from android_world.env import adb_utils
+    from .ports import pixel
+
+    if action.kind is ActionKind.TAP:
+        if action.x is None or action.y is None:
+            raise ValueError("AndroidWorld tap requires normalized x/y")
+        adb_utils.tap_screen(pixel(action.x, observation.width), pixel(action.y, observation.height), controller)
+    elif action.kind is ActionKind.TYPE_TEXT:
+        adb_utils.type_text(action.text, controller, timeout_sec=10)
+    elif action.kind is ActionKind.KEY:
+        if action.key in {"BACK", "KEYCODE_BACK"}:
+            adb_utils.press_back_button(controller)
+        elif action.key in {"HOME", "KEYCODE_HOME"}:
+            adb_utils.press_home_button(controller)
+        elif action.key in {"ENTER", "KEYCODE_ENTER"}:
+            adb_utils.press_enter_button(controller)
+        else:
+            raise ValueError(f"AndroidWorld direct adapter does not support key {action.key}")
+    elif action.kind is ActionKind.LAUNCH_APP:
+        adb_utils.launch_app(action.package, controller)
+    elif action.kind is ActionKind.WAIT:
+        time.sleep(1.0)
+    elif action.kind is ActionKind.SWIPE:
+        if None in (action.x, action.y, action.x2, action.y2):
+            raise ValueError("AndroidWorld swipe requires four normalized coordinates")
+        command = adb_utils.generate_swipe_command(
+            pixel(action.x, observation.width), pixel(action.y, observation.height),
+            pixel(action.x2, observation.width), pixel(action.y2, observation.height),
+            500,
+        )
+        adb_utils.issue_generic_request(command, controller)
+    else:
+        raise ValueError(f"AndroidWorld direct adapter cannot map action {action.kind}")
+
+
+def _swipe_direction(action: Action) -> str:
+    """Map portable swipe coordinates to current AndroidWorld's direction API."""
+    assert None not in (action.x, action.y, action.x2, action.y2)
+    dx = action.x2 - action.x
+    dy = action.y2 - action.y
+    if abs(dx) >= abs(dy):
+        return "right" if dx >= 0 else "left"
+    return "down" if dy >= 0 else "up"
 
 
 class AndroidWorldVerifier(Verifier):
